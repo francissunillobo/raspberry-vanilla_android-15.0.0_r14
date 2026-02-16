@@ -1,0 +1,156 @@
+diff --git a/boot/config.txt b/boot/config.txt
+index 983a178..38e06a5 100644
+--- a/boot/config.txt
++++ b/boot/config.txt
+@@ -33,3 +33,6 @@ dtoverlay=dwc2,dr_mode=peripheral
+ [cm5]
+ dtoverlay=dwc2,dr_mode=otg
+ [all]
++
++# Fan: controlled by vendor fancontrol service (temp-based PWM)
++# Do not use dtoverlay=gpio-fan here to avoid conflict.
+diff --git a/device.mk b/device.mk
+index 8078f05..26f04be 100644
+--- a/device.mk
++++ b/device.mk
+@@ -234,6 +234,11 @@ PRODUCT_COPY_FILES += \
+     $(DEVICE_PATH)/ramdisk/init.rpi5.usb.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/hw/init.rpi5.usb.rc \
+     $(DEVICE_PATH)/ramdisk/ueventd.rpi5.rc:$(TARGET_COPY_OUT_VENDOR)/etc/ueventd.rc
+ 
++# Fan control (temp-based: OFF < 45C, LOW 45-55C, MEDIUM 55-65C, FULL >= 65C)
++PRODUCT_COPY_FILES += \
++    $(DEVICE_PATH)/fancontrol.sh:$(TARGET_COPY_OUT_VENDOR)/bin/fancontrol.sh \
++    $(DEVICE_PATH)/fancontrol.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/fancontrol.rc
++
+ # Seccomp
+ PRODUCT_COPY_FILES += \
+     $(DEVICE_PATH)/seccomp_policy/mediacodec.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/mediacodec.policy \
+diff --git a/fancontrol.rc b/fancontrol.rc
+new file mode 100644
+index 0000000..a1b2c3d
+--- /dev/null
++++ b/fancontrol.rc
+@@ -0,0 +1,7 @@
++# Fan control: temp-based PWM (OFF < 45C, LOW 45-55C, MEDIUM 55-65C, FULL >= 65C)
++# Starts with late_start (during boot); fan runs at MEDIUM until thermal loop takes over.
++service fancontrol /vendor/bin/fancontrol.sh
++    class late_start
++    user root
++    group root system
++
+diff --git a/fancontrol.sh b/fancontrol.sh
+new file mode 100644
+index 0000000..b2c3d4e
+--- /dev/null
++++ b/fancontrol.sh
+@@ -0,0 +1,100 @@
++#!/system/bin/sh
++# RPi5 fan control: on during boot, then temp-based curve
++# < 45 C: OFF | 45-55 C: LOW | 55-65 C: MEDIUM | >= 65 C: FULL
++
++T=/sys/class/thermal/thermal_zone0/temp
++# PWM 0-255; try hwmon first, then pwmchip (GPIO 12 = PWM0 on RPi)
++PWM_PATH=""
++PWM_ENABLE=""
++PWM_MAX=255
++
++# Find hwmon pwm1 (e.g. pwm-fan)
++for h in /sys/class/hwmon/hwmon*/pwm1; do
++  if [ -f "$h" ]; then
++    PWM_PATH="$h"
++    PWM_ENABLE="${h%pwm1}pwm1_enable"
++    break
++  fi
++done
++
++# Fallback: pwmchip0 pwm0 (GPIO 12 on RPi)
++if [ -z "$PWM_PATH" ] && [ -d /sys/class/pwm/pwmchip0 ]; then
++  if [ ! -d /sys/class/pwm/pwmchip0/pwm0 ]; then
++    echo 0 > /sys/class/pwm/pwmchip0/export 2>/dev/null
++  fi
++  if [ -d /sys/class/pwm/pwmchip0/pwm0 ]; then
++    # Period in ns (e.g. 25 kHz = 40000 ns); duty 0-period
++    echo 40000 > /sys/class/pwm/pwmchip0/pwm0/period 2>/dev/null
++    echo 0 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
++    echo 1 > /sys/class/pwm/pwmchip0/pwm0/enable 2>/dev/null
++    PWM_PATH="/sys/class/pwm/pwmchip0/pwm0/duty_cycle"
++    PWM_MAX=40000
++  fi
++fi
++
++# Fallback: GPIO 12 on/off only
++GPIO_12="/sys/class/gpio/gpio12/value"
++if [ -z "$PWM_PATH" ] && [ -d /sys/class/gpio ]; then
++  if [ ! -d /sys/class/gpio/gpio12 ]; then
++    echo 12 > /sys/class/gpio/export 2>/dev/null
++  fi
++  if [ -f "$GPIO_12" ]; then
++    echo out > /sys/class/gpio/gpio12/direction 2>/dev/null
++    PWM_PATH="gpio12"
++    PWM_MAX=1
++  fi
++fi
++
++set_speed() {
++  local speed=$1
++  if [ -z "$PWM_PATH" ]; then return; fi
++  if [ "$PWM_PATH" = "gpio12" ]; then
++    if [ "$speed" -gt 0 ] 2>/dev/null; then echo 1 > $GPIO_12; else echo 0 > $GPIO_12; fi
++    return
++  fi
++  if [ -n "$PWM_ENABLE" ] && [ -f "$PWM_ENABLE" ]; then
++    echo 1 > "$PWM_ENABLE" 2>/dev/null
++  fi
++  if [ "$PWM_MAX" = "40000" ]; then
++    # duty_cycle 0-40000
++    echo $(( (speed * 40000) / 255 )) > "$PWM_PATH" 2>/dev/null
++  else
++    echo $speed > "$PWM_PATH" 2>/dev/null
++  fi
++}
++
++# Thermal read (millidegrees)
++get_temp() {
++  if [ -f "$T" ]; then
++    cat "$T" 2>/dev/null || echo 0
++  else
++    echo 0
++  fi
++}
++
++# Temp curve: <45 off, 45-55 LOW(64), 55-65 MEDIUM(170), >=65 FULL(255)
++speed_from_temp() {
++  local t=$1
++  if [ "$t" -lt 45000 ]; then echo 0
++  elif [ "$t" -lt 55000 ]; then echo 64    # LOW ~25%
++  elif [ "$t" -lt 65000 ]; then echo 170  # MEDIUM ~66%
++  else echo 255                            # FULL
++  fi
++}
++
++if [ -z "$PWM_PATH" ]; then
++  exit 0
++fi
++
++# Boot: run fan at MEDIUM for 60s so it spins while system loads
++set_speed 170
++sleep 60
++
++# Then temp-based loop
++while true; do
++  temp=$(get_temp)
++  speed=$(speed_from_temp "$temp")
++  set_speed $speed
++  sleep 2
++done
++
+diff --git a/ramdisk/init.rpi5.rc b/ramdisk/init.rpi5.rc
+index 07cf654..f6a601c 100644
+--- a/ramdisk/init.rpi5.rc
++++ b/ramdisk/init.rpi5.rc
+@@ -1,4 +1,5 @@
+ import /vendor/etc/init/hw/init.rpi5.usb.rc
++import /vendor/etc/init/fancontrol.rc
+ 
+ on init
+     symlink /sdcard /storage/sdcard0
