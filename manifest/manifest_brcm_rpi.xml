@@ -5,7 +5,7 @@
   <!-- Lobo AOSP Platform -->
   <project name="francissunillobo/lobo-aosp-platform" path="vendor/lobo_platform" remote="github" revision="main">
     <linkfile src="vendor/lobo" dest="vendor/lobo" />
-    <linkfile src="device/brcm/rpi5_custom" dest="device/brcm/rpi5_custom" />
+    <linkfile src="projects/rpi5_custom" dest="vendor/projects/rpi5_custom" />
   </project>
 
   <!-- Raspberry Pi -->
